@@ -42,6 +42,7 @@ class MyDriver(Driver):
         self.sl_data = {action: [] for action in Action.get_sl_actions()}  # straight line actions
         self.drs_data = {action: [] for action in [Action.LightThrottle, Action.FullThrottle, Action.Continue]}  # drs actions
 
+        self.top_speed = 230
         # self.end_of_straight_speed = 350 / 2  # moved into a property
         # self.lowest_crash_speed = 350
         self.in_maze_branch = False
@@ -51,7 +52,7 @@ class MyDriver(Driver):
         self.uturn_speed = 350 / 2  #  initialise it to be half top speed
         self.max_safe_uturn_speed = np.nan
         self.min_unsafe_uturn_speed = np.nan
-        self.target_speeds = 350 * np.ones(50)
+        self.target_speeds = self.top_speed * np.ones(50)
         # self.target_speeds[0] = self.corner_speed
         self.target_speeds[0] = self.end_of_straight_speed
         self.drs_was_active = False
@@ -64,7 +65,7 @@ class MyDriver(Driver):
 
         # Tyres!
         self.tyre_data = {tyre_choice: np.empty((1000, 0)) for tyre_choice in TyreChoice.get_choices()}
-        self.current_tyre_choice = TyreChoice.Medium            # hard coded for now, you can improve this!
+        self.current_tyre_choice = TyreChoice.Hard            # hard coded for now, you can improve this!
         self.current_tyre_age = 0
         self.current_base_tyre_model = None
         self.current_tyre_parameters = None
@@ -73,6 +74,10 @@ class MyDriver(Driver):
         self.allow_pitstops = allow_pitstops
         self.pit_loss = 3.0
         self.timings = defaultdict(lambda: 0)
+        self.tyre_approx_track_len_life = defaultdict(list)
+        self.race_tyre_move_life = []
+        self.race_tyre_strategy = []
+        self.race_tyre_index = 0
 
         # Plotting of grip data
         self.grip_fig = grip_fig
@@ -98,9 +103,6 @@ class MyDriver(Driver):
         self.track_grip_model_y = None
         self.num_previous_steps = None
         self.num_future_steps = None
-
-        # Other
-        self.max_straight_length = 0
         
         
     def prepare_for_race(self):
@@ -128,6 +130,46 @@ class MyDriver(Driver):
         # self.current_tyre_choice = ...
 
         self.track_info = track_info
+
+        if self.move_number == 0:
+            # going back to mediums
+            self.race_tyre_strategy = [TyreChoice.Medium]
+
+            # # strategize for race
+            # if len(self.tyre_approx_track_len_life[TyreChoice.Medium]) == 0:
+            #     # get some data on medium tires
+            #     self.race_tyre_strategy = [TyreChoice.Medium, TyreChoice.Hard]
+            # else:
+            #     medium_track_life = np.mean(self.tyre_approx_track_len_life[TyreChoice.Medium])
+            #     # assume hard can go to the end of the race until we have data
+            #     hard_track_life = (np.mean(self.tyre_approx_track_len_life[TyreChoice.Hard]) 
+            #         if TyreChoice.Hard in self.tyre_approx_track_len_life else self.track_info.length + 1)
+
+            #     # no stop strategies
+            #     if self.track_info.length < medium_track_life:
+            #         self.race_tyre_strategy = [TyreChoice.Medium]
+            #     elif self.track_info.length < hard_track_life:
+            #         self.race_tyre_strategy = [TyreChoice.Hard]
+
+            #     # one stop strategies
+            #     elif self.track_info.length < 2 * medium_track_life * .9:
+            #         self.race_tyre_strategy = [TyreChoice.Medium, TyreChoice.Medium]
+            #     elif self.track_info.length < (medium_track_life + hard_track_life) * .9:
+            #         self.race_tyre_strategy = [TyreChoice.Medium, TyreChoice.Hard]
+
+            #     # just go with hards
+            #     else:
+            #         self.race_tyre_strategy = [TyreChoice.Hard]
+            # if self.print_info:
+            #     print('race_strategy', self.race_tyre_strategy)
+        else:
+            # get next tyre in strategy
+            self.race_tyre_index += 1
+
+        if len(self.race_tyre_move_life) > len(self.race_tyre_strategy):
+            self.race_tyre_strategy.append(self.race_tyre_strategy[-1])
+
+        self.current_tyre_choice = self.race_tyre_strategy[self.race_tyre_index] if self.race_tyre_index < len(self.race_tyre_strategy) else self.race_tyre_strategy[-1]
         self.fit_base_tyre_model()
         return self.current_tyre_choice
 
@@ -191,10 +233,15 @@ class MyDriver(Driver):
         # Are we changing tyres?
         if self.box_box_box and car_state.speed == 0:
             self.box_box_box = False
+            self.race_tyre_move_life.append(self.race_tyre_move_life[-1] - self.move_number if len(self.race_tyre_move_life) else self.move_number)
             return Action.ChangeTyres
 
         # Get the target speed
         target_speed = self._get_target_speed(track_state.distance_ahead, track_state.safety_car_active)
+
+        # Reduce target speed due to rain intensity
+        if weather_state.rain_intensity > 0:
+            target_speed = target_speed * max(((200 - weather_state.rain_intensity) / 200), .5)
 
         # Get the current grip level
         current_grip = self.get_grip(car_state, turns_ahead=0, weather_state=weather_state)
@@ -225,7 +272,7 @@ class MyDriver(Driver):
             time_drs = (1 / (car_state.speed + 1)) + time_drs
 
             if (time_drs < time_no_drs or driver_rng().rand() < self.random_action_probability
-                or any(len(data) < 10 for data in self.drs_data.values())) and not targets_broken_drs:
+                or any(len(data) < 10 for data in self.drs_data.values())) and not targets_broken_drs and not track_state.distance_ahead <= 3:
                 action = Action.OpenDRS
                 self.drs_was_active = True
                 if self.print_info:
@@ -236,8 +283,6 @@ class MyDriver(Driver):
         self.random_action_probability = max(self.random_action_probability * self.random_action_decay,
                                              self.min_random_action_probability)
 
-        self.max_straight_length = max(track_state.distance_ahead, self.max_straight_length)
-
         return action
 
         
@@ -246,13 +291,13 @@ class MyDriver(Driver):
         self.in_maze_branch = False
         if track_state.distance_left > 0 and track_state.distance_right > 0:  # both options available, need to decide
             self.in_maze_branch = True
-            if len(self.correct_turns) > 0:
-                # TODO: probably want to put some limit on distance.  It is also doing a 1 nearest neighbor (can optimize).
-                
+            if len(self.correct_turns) > 0:                
                 # Find the closest turn we have seen previously and turn in the same direction
                 distances = np.array([track_state.position.distance_to(turn_position)
                                       for turn_position in self.correct_turns])
                 i_closest = np.argmin(distances)
+                if distances[i_closest] > self.track_info.average_straight * 1.5:
+                    return driver_rng().choice([Action.TurnLeft, Action.TurnRight])
                 return list(self.correct_turns.values())[i_closest]
 
             else:  # First race, no data yet so choose randomly
@@ -489,7 +534,7 @@ class MyDriver(Driver):
 
         # Pre compute the changes in speed for quicker look up. As the grip changes down the straight we compute deltas
         # with grip = 1 and then convert to next speeds later
-        test_input_speeds = np.linspace(0, 350, 351)
+        test_input_speeds = np.linspace(0, self.top_speed, self.top_speed + 1)
         actions = list(self.sl_data.keys())
         test_speed_deltas = np.zeros((test_input_speeds.size, len(actions)))
         for i, action in enumerate(actions):
@@ -887,18 +932,25 @@ class MyDriver(Driver):
                         print(f'\tCrashed! We targeted {self.target_speeds[0]:.0f} speed '
                               f'but were going {previous_car_state.speed: .0f}. '
                               f'We thought we would be going {est_speed :.0f} using a grip of {grip:.2f}.'
+                              f'Weather: {previous_weather_state}'
+                              f'left {previous_track_state.distance_left}, right {previous_track_state.distance_right}'
                               f'DRS was {"" if self.drs_was_active else "not "}active this straight.')
 
                     else:
                         print(f'\tCrashed! We targeted {self.target_speeds[0]:.0f} speed '
                               f'and were going {previous_car_state.speed: .0f}. '
                               f'EoS speed unmodified is {self.end_of_straight_speed: .0f}. '
+                              f'Weather: {previous_weather_state}'
+                              f'left {previous_track_state.distance_left}, right {previous_track_state.distance_right}'
                               f'We used a grip of {grip:.2f} which gives {grip * self.end_of_straight_speed: .0f}')
 
-                if previous_track_state.distance_left > 0 ^ previous_track_state.distance_right > 0:
-                    self.min_unsafe_corner_speed = np.nanmin([self.min_unsafe_corner_speed * .95, previous_car_state.speed / grip - 15])
                 if previous_track_state.distance_left == 0 and previous_track_state.distance_right == 0:
-                    self.min_unsafe_uturn_speed = np.nanmin([self.min_unsafe_uturn_speed * .95, previous_car_state.speed / grip - 15])
+                    if self.print_info: print(self.min_unsafe_uturn_speed * .95, previous_car_state.speed / grip - 10)
+                    self.min_unsafe_uturn_speed = np.nanmin([self.min_unsafe_uturn_speed * .95, previous_car_state.speed / grip - 10])
+                elif previous_track_state.distance_left > 0 or previous_track_state.distance_right > 0:
+                    if self.print_info:print(self.min_unsafe_corner_speed * .95, previous_car_state.speed / grip - 10)
+                    self.min_unsafe_corner_speed = np.nanmin([self.min_unsafe_corner_speed * .95, previous_car_state.speed / grip - 10])
+                
 
                 # self.end_of_straight_speed = min(self.end_of_straight_speed,
                 #                                  previous_car_state.speed / grip - 10)
@@ -999,7 +1051,7 @@ class MyDriver(Driver):
         elif self.safety_car_running:
             # previous_car_state.speed seems to become more noisy for some reason, results of setting directly to it doesn't work
             self.safety_car_speed = min(max(self.safety_car_speed, previous_car_state.speed), 
-                                        self.penalty_speed - 10, 
+                                        self.penalty_speed - 20, 
                                         (self.penalty_speed + self.min_unsafe_safety_car_speed) / 2)
             # self.safety_car_speed = max(self.safety_car_speed, previous_car_state.speed)
         if prev_safety_car_speed > self.safety_car_speed:
@@ -1026,7 +1078,7 @@ class MyDriver(Driver):
 
         # Pre compute the changes in speed for quicker look up. As the grip changes down the straight we compute deltas
         # with grip = 1 and then convert to next speeds later
-        test_input_speeds = np.linspace(0, 350, 351)
+        test_input_speeds = np.linspace(0, self.top_speed, self.top_speed + 1)
         test_speed_deltas = {action: self.estimate_next_speed(action, test_input_speeds, False, grip_multiplier=1)
                                      - test_input_speeds
                              for action in self.sl_data}
@@ -1064,6 +1116,16 @@ class MyDriver(Driver):
         self.correct_turns.update(correct_turns)            # dictionary mapping Position -> TurnLeft or TurnRight
         self.n_safety_car_penalties = 0
         
+        # Calculate tire information
+        for i, tyre_move_life in enumerate(self.race_tyre_move_life):
+            tyre_race_ratio = tyre_move_life / self.move_number
+            self.tyre_approx_track_len_life[self.race_tyre_strategy[i]].append(tyre_race_ratio * self.track_info.length)
+
+        # Reset move number (because choose_tyres() called before prepare_for_race())
+        self.move_number = 0
+        self.race_tyre_index = 0
+        self.race_tyre_move_life = []
+
         
     def get_safety_car_speed_estimate(self):
         return self.safety_car_speed
