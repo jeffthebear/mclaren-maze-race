@@ -11,8 +11,6 @@ from resources.states import *
 from resources.rng import driver_rng
 from drivers.driver import Driver
 
-# TODO: Find out why Driver doesn't stop at the edges of the maze, seems like a condition wasn't caught
-
 class MyDriver(Driver):
     def __init__(self, name, print_info=False, random_action_probability=0.9, random_action_decay=0.99,
                  min_random_action_probability=0.0, *args, **kwargs):
@@ -24,26 +22,40 @@ class MyDriver(Driver):
         
         # avoiding safety car penalties are important (find speed not incurring penalties)
         self.safety_car_running = False
-        self.safety_car_speed = 150         # initialise it to be at a medium speed
+        self.safety_car_speed = 190
+        # self.safety_car_speed = int(kwargs.get('safety_car_speed', 190))         # initialise it to be at a medium speed
+        self.initial_safety_car_speed = self.safety_car_speed
         self.n_safety_cars = 0
         self.n_safety_car_penalties = 0
         self.min_unsafe_safety_car_speed = self.safety_car_speed
+        self.penalty_speed = self.safety_car_speed
         
         self.correct_turns = {}
         
         self.sl_data = {action: [] for action in Action.get_sl_actions()}  # straight line actions
         self.drs_data = {action: [] for action in [Action.LightThrottle, Action.FullThrottle, Action.Continue]}  # drs actions
+        self.top_speed = 210
+        # self.top_speed = kwargs.get('top_speed', 210)
         self.corner_speed = 350 / 2  # initialise it to be half top speed (renamed from end_of_straight_speed)
         self.max_safe_corner_speed = np.nan
         self.min_unsafe_corner_speed = np.nan
         self.uturn_speed = 350 / 2  #  initialise it to be half top speed
         self.max_safe_uturn_speed = np.nan
         self.min_unsafe_uturn_speed = np.nan
-        self.target_speeds = 350 * np.ones(50)
+        self.target_speeds = self.top_speed * np.ones(50)
         self.target_speeds[0] = self.corner_speed
         self.drs_was_active = False
         self.in_maze_branch = False
-        
+
+        self.penalty_speed_ratio = .5
+        # self.penalty_speed_ratio = kwargs.get('penalty_speed_ratio', .5)
+        self.penalty_speed_decrement = 10.
+        # self.penalty_speed_decrement = kwargs.get('penalty_speed_decrement', 10.)
+        self.unsafe_car_speed_decay = .95
+        # self.unsafe_car_speed_decay = kwargs.get('unsafe_car_speed_decay', .95)
+        self.unsafe_car_speed_decrement = 10
+        # self.unsafe_car_speed_decrement = kwargs.get('unsafe_car_speed_decrement', 10.)
+
         self.sl_data = {**self.sl_data, **{
             Action.LightBrake: [[0,0]], # pretty sure braking at 0 will be 0 speed always
             Action.HeavyBrake: [[0,0]],
@@ -91,7 +103,7 @@ class MyDriver(Driver):
             time_drs = (1 / (car_state.speed + 1)) + time_drs
 
             if (time_drs < time_no_drs or driver_rng().rand() < self.random_action_probability
-                or any(len(data) < 10 for data in self.drs_data.values())) and not targets_broken_drs:
+                or any(len(data) < 10 for data in self.drs_data.values())) and not targets_broken_drs and not track_state.distance_ahead <= 3:
                 action = Action.OpenDRS
                 self.drs_was_active = True
                 if self.print_info:
@@ -215,7 +227,7 @@ class MyDriver(Driver):
             if self.safety_car_running:
                 self.n_safety_cars += 1
                 self.safety_car_running = False
-            self.safety_car_speed = min(150, self.min_unsafe_safety_car_speed - 10)
+            self.safety_car_speed = min(self.initial_safety_car_speed, self.min_unsafe_safety_car_speed - 10)
             
 
         if previous_track_state.distance_ahead == 0:
@@ -224,10 +236,13 @@ class MyDriver(Driver):
                 if self.print_info:
                     print(f'\tCrashed! We targeted {self.corner_speed: .0f} speed and were going '
                           f'{previous_car_state.speed: .0f}')
-                if previous_track_state.distance_left > 0 ^ previous_track_state.distance_right > 0:
-                    self.min_unsafe_corner_speed = np.nanmin([self.min_unsafe_corner_speed, previous_car_state.speed])
+
                 if previous_track_state.distance_left == 0 and previous_track_state.distance_right == 0:
-                    self.min_unsafe_uturn_speed = np.nanmin([self.min_unsafe_uturn_speed, previous_car_state.speed])
+                    if self.print_info: print(self.min_unsafe_uturn_speed * self.unsafe_car_speed_decay, previous_car_state.speed - self.unsafe_car_speed_decrement)
+                    self.min_unsafe_uturn_speed = np.nanmin([self.min_unsafe_uturn_speed * self.unsafe_car_speed_decay, previous_car_state.speed - self.unsafe_car_speed_decrement])
+                elif previous_track_state.distance_left > 0 or previous_track_state.distance_right > 0:
+                    if self.print_info:print(self.min_unsafe_corner_speed * self.unsafe_car_speed_decay, previous_car_state.speed - self.unsafe_car_speed_decrement)
+                    self.min_unsafe_corner_speed = np.nanmin([self.min_unsafe_corner_speed * self.unsafe_car_speed_decay, previous_car_state.speed - self.unsafe_car_speed_decrement])
             else:
                 if previous_track_state.distance_left == 0 and previous_track_state.distance_right == 0:
                     self.max_safe_uturn_speed = np.nanmax([self.max_safe_uturn_speed, previous_car_state.speed])
@@ -279,9 +294,16 @@ class MyDriver(Driver):
             # try to go just a bit slower than min_unsafe_safety_car_speed
             self.min_unsafe_safety_car_speed = min(self.min_unsafe_safety_car_speed, previous_car_state.speed)
             self.safety_car_speed = min(self.min_unsafe_safety_car_speed - 10, self.safety_car_speed)
+            self.penalty_speed = min(self.penalty_speed, previous_car_state.speed)
+            if self.print_info:
+                print('sc penalty', self.n_safety_cars, previous_car_state.speed, self.min_unsafe_safety_car_speed, self.safety_car_speed)
         elif self.safety_car_running:
-            self.safety_car_speed = max(self.safety_car_speed, previous_car_state.speed)
-
+            # previous_car_state.speed seems to become more noisy for some reason, results of setting directly to it doesn't work
+            self.safety_car_speed = min(max(self.safety_car_speed, previous_car_state.speed), 
+                                        self.penalty_speed - self.penalty_speed_decrement, 
+                                        (self.penalty_speed * self.penalty_speed_ratio + 
+                                            self.min_unsafe_safety_car_speed * (1 - self.penalty_speed_ratio)))
+            # self.safety_car_speed = max(self.safety_car_speed, previous_car_state.speed)
         if prev_safety_car_speed > self.safety_car_speed:
             if self.print_info:
                 print(f'\tDecreasing estimate of safety car speed from {self.safety_car_speed: .1f} to {self.safety_car_speed}')
@@ -294,7 +316,7 @@ class MyDriver(Driver):
         previous_targets = np.copy(self.target_speeds)
         speed = self.corner_speed if self.in_maze_branch == False else self.uturn_speed
 
-        test_input_speeds = np.linspace(0, 350, 351)
+        test_input_speeds = np.linspace(0, self.top_speed, self.top_speed + 1)
         test_output_speeds = {action: self.estimate_next_speed(action, test_input_speeds, False)
                               for action in self.sl_data}
 
