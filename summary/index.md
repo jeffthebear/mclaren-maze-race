@@ -30,7 +30,6 @@ On the Pro Driver level there were additional factors around predicting the grip
 
 ```
 def objective(args):
-    global run
     driver = MyDriver('my_driver', **args)
     times = []
     for i in range(24):
